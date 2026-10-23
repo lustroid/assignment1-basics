@@ -90,7 +90,7 @@ def test_train_bpe_special_tokens(snapshot):
 def test_train_bpe_TinyStory():
     start_time = time.perf_counter()
     vocab, merges = run_train_bpe(
-        input_path='/home/ez/Transformer/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt',
+        input_path='/home/ez/Transformer/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt',
         vocab_size=10000,
         special_tokens=["<|endoftext|>"],
         num_workers=4,

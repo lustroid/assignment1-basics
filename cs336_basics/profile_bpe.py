@@ -2,6 +2,8 @@
 
 Run with: python -m cs336_basics.profile_bpe INPUT --output-dir /tmp/bpe-run
 Use a separate invocation per worker count for independent memory measurements.
+Each run saves vocab.json and merges.json with hex-encoded bytes, plus a
+longest_tokens.txt inspection summary, in the output directory.
 """
 
 import argparse
@@ -15,7 +17,43 @@ import tempfile
 from pathlib import Path
 from time import perf_counter
 
-from .bpe import single_bpe
+from .bpe import Pair, single_bpe
+
+
+def _save_training_artifacts(output_dir: Path, vocab: dict[int, bytes], merges: list[Pair]) -> dict[str, object]:
+    """Save exact token bytes and merge order, with a readable longest-token summary."""
+    vocab_path = output_dir / "vocab.json"
+    merges_path = output_dir / "merges.json"
+    summary_path = output_dir / "longest_tokens.txt"
+    vocab_path.write_text(
+        json.dumps({str(key): value.hex() for key, value in sorted(vocab.items())}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    merges_path.write_text(
+        json.dumps([(left.hex(), right.hex()) for left, right in merges], indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    longest_length = max((len(token) for token in vocab.values()), default=0)
+    longest_ids = sorted(key for key, token in vocab.items() if len(token) == longest_length)
+    lines = [f"Longest token byte length: {longest_length}", ""]
+    for token_id in longest_ids:
+        token = vocab[token_id]
+        try:
+            readable = repr(token.decode("utf-8"))
+        except UnicodeDecodeError:
+            readable = "<invalid UTF-8>"
+        lines.append(f"id={token_id} bytes={len(token)} raw={token!r} utf8={readable}")
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "artifact_paths": {
+            "vocab": str(vocab_path.resolve()),
+            "merges": str(merges_path.resolve()),
+            "longest_tokens": str(summary_path.resolve()),
+        },
+        "longest_token_byte_length": longest_length,
+        "longest_token_ids": longest_ids,
+    }
 
 
 def main() -> None:
@@ -60,6 +98,8 @@ def main() -> None:
         },
         separators=(",", ":"),
     ).encode("utf-8")
+    # Training timing, memory counters, and profiling have already stopped.
+    artifacts = _save_training_artifacts(args.output_dir, vocab, merges)
     report = {
         "input_path": str(args.input_path.resolve()),
         "input_bytes": args.input_path.stat().st_size,
@@ -74,6 +114,7 @@ def main() -> None:
         "parent_peak_rss_bytes": parent_peak_rss,
         "largest_child_peak_rss_bytes": child_peak_rss,
         "memory_note": "OS process high-water marks, including interpreter overhead; child peak is not aggregate memory.",
+        **artifacts,
     }
     report_text = json.dumps(report, indent=2)
     (args.output_dir / "report.json").write_text(report_text + "\n", encoding="utf-8")
