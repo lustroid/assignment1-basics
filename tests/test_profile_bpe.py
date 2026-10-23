@@ -49,7 +49,7 @@ def test_artifacts_replace_existing_outputs_and_support_no_merges(tmp_path):
 @pytest.mark.parametrize("profile", [False, True])
 def test_command_saves_training_outputs(tmp_path, profile):
     corpus = tmp_path / "corpus.txt"
-    corpus.write_text("aaa 牛 café<|endoftext|>aaa 牛 café<|endoftext|>ababab", encoding="utf-8")
+    corpus.write_text("aaa 牛 café<|endoftext|>aaa 牛 café<|endoftext|>ababab" * 25_000, encoding="utf-8")
     output = tmp_path / "outputs"
     command = [
         sys.executable,
@@ -58,6 +58,8 @@ def test_command_saves_training_outputs(tmp_path, profile):
         str(corpus),
         "--num-workers",
         "2",
+        "--chunk-size-mib",
+        "1",
         "--vocab-size",
         "280",
         "--output-dir",
@@ -80,6 +82,8 @@ def test_command_saves_training_outputs(tmp_path, profile):
     ).encode("utf-8")
     assert report["result_sha256"] == hashlib.sha256(signature).hexdigest()
     assert report["longest_token_byte_length"] == max(map(len, vocab.values()))
+    assert report["chunk_size_bytes"] == 1024 * 1024
+    assert report["stage_seconds"]["chunks"] >= 2
     assert report["artifact_paths"]["vocab"] == str(output / "vocab.json")
     if profile:
         stats = pstats.Stats(str(next(output.glob("profiles-*/parent.prof"))))

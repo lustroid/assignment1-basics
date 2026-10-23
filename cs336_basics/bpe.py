@@ -4,7 +4,8 @@ import multiprocessing
 import os
 import re as standard_re
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from itertools import islice
 from pathlib import Path
 from time import perf_counter
 
@@ -66,31 +67,31 @@ def _count_chunk(task: tuple[str, int, int, list[str], str | None]) -> Counter[b
     return counts
 
 
-def _chunk_boundaries(input_path: str, num_workers: int, special_tokens: list[str]) -> list[int]:
+def _chunk_boundaries(input_path: str, chunk_size_bytes: int, special_tokens: list[str]) -> list[int]:
     """Split only at complete special-token matches, including overlapping literals.
 
     mmap lets the boundary scan operate on bytes without copying the full corpus.
     With no special tokens (or no matches), keep one chunk rather than split a
-    UTF-8 character or regex pre-token. Uneven documents can yield fewer chunks.
+    UTF-8 character or regex pre-token. The target is a soft limit: a document
+    longer than the target remains intact. Chunk size is independent of workers.
     """
     size = os.path.getsize(input_path)
-    if num_workers == 1 or not special_tokens or size == 0:
+    if not special_tokens or size <= chunk_size_bytes:
         return [0, size]
 
     ordered_tokens = sorted(special_tokens, key=lambda token: len(token), reverse=True)
     escaped_tokens: list[bytes] = [standard_re.escape(token.encode("utf-8")) for token in ordered_tokens]
     pattern = standard_re.compile(b"|".join(escaped_tokens))
     boundaries = [0]
-    target = 1
+    target = chunk_size_bytes
     with open(input_path, "rb") as corpus, mmap.mmap(corpus.fileno(), 0, access=mmap.ACCESS_READ) as content:
         for match in pattern.finditer(content):
             position = match.start()
-            if position * num_workers < size * target:
+            if position < target:
                 continue
             boundaries.append(position)
-            while target < num_workers and position * num_workers >= size * target:
-                target += 1
-            if target == num_workers:
+            target = position + chunk_size_bytes
+            if target >= size:
                 break
     boundaries.append(size)
     return boundaries
@@ -102,6 +103,7 @@ def single_bpe(
     special_tokens: list[str],
     *,
     num_workers: int = 1,
+    chunk_size_bytes: int = 128 * 1024 * 1024,
     profile_dir: str | os.PathLike | None = None,
     timings: dict[str, float] | None = None,
     **kwargs,
@@ -113,7 +115,9 @@ def single_bpe(
     occurrence set contains the positions of its left nodes. Heap entries are
     validated against the current weighted pair counts when popped.
 
-    Each worker reads its assigned UTF-8 chunk into memory. Without special-token
+    Each worker reads one document-aligned chunk at a time, targeting 128 MiB by
+    default. At most num_workers tasks are outstanding; waiting tasks hold only
+    file offsets. Chunk size is a soft limit. Without special-token
     boundaries, pre-tokenization stays sequential. profile_dir optionally records
     a cProfile file per parallel chunk (sequential work is captured by the caller's
     profiler); timings receives stage wall times in seconds.
@@ -121,6 +125,8 @@ def single_bpe(
     started = perf_counter()
     if num_workers < 1:
         raise ValueError("num_workers must be positive")
+    if chunk_size_bytes < 1:
+        raise ValueError("chunk_size_bytes must be positive")
     special_tokens = list(dict.fromkeys(special_tokens))
     if any(not token for token in special_tokens):
         raise ValueError("Special tokens must be nonempty strings")
@@ -137,22 +143,35 @@ def single_bpe(
     if profile_dir is not None:
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
     input_path = os.fspath(input_path)
-    boundaries = _chunk_boundaries(input_path, num_workers, special_tokens)
+    boundaries = _chunk_boundaries(input_path, chunk_size_bytes, special_tokens)
     tasks = [
         (input_path, start, end, special_tokens, os.fspath(profile_dir) if profile_dir is not None else None)
         for start, end in zip(boundaries, boundaries[1:])
     ]
     boundary_finished = perf_counter()
     pretoken_count: Counter[bytes] = Counter()
-    if len(tasks) == 1:
+    if num_workers == 1 or len(tasks) == 1:
         # Keep sequential work inside the caller's profile, rather than nesting
         # a second cProfile instance (which Python does not support).
-        pretoken_count = _count_pretokens(input_path, tasks[0][1], tasks[0][2], special_tokens)
+        for task in tasks:
+            pretoken_count.update(_count_pretokens(input_path, task[1], task[2], special_tokens))
     else:
-        with ProcessPoolExecutor(max_workers=len(tasks), mp_context=multiprocessing.get_context("spawn")) as pool:
-            for counts in pool.map(_count_chunk, tasks):
-                pretoken_count.update(counts)
-        del counts
+        workers = min(num_workers, len(tasks))
+        task_iterator = iter(tasks)
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
+            pending = {pool.submit(_count_chunk, task) for task in islice(task_iterator, workers)}
+            while pending:
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    counts = future.result()
+                    pretoken_count.update(counts)
+                    del counts
+                # Futures retain their results. Drop them before scheduling
+                # replacements so completed counters cannot accumulate.
+                completed.clear()
+                del future
+                for task in islice(task_iterator, workers - len(pending)):
+                    pending.add(pool.submit(_count_chunk, task))
     pretokenization_finished = perf_counter()
 
     # Indices never shift. Empty bytes mark consumed nodes; live tokens are nonempty.

@@ -60,6 +60,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_path", type=Path)
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument(
+        "--chunk-size-mib", type=int, default=128, help="Target input bytes per chunk in MiB (default: 128)"
+    )
     parser.add_argument("--vocab-size", type=int, default=10_000)
     parser.add_argument("--special-token", action="append", default=None)
     parser.add_argument("--profile", action="store_true", help="Enable cProfile (adds runtime overhead)")
@@ -78,6 +81,7 @@ def main() -> None:
             args.vocab_size,
             args.special_token if args.special_token is not None else ["<|endoftext|>"],
             num_workers=args.num_workers,
+            chunk_size_bytes=args.chunk_size_mib * 1024 * 1024,
             profile_dir=profile_dir,
             timings=timings,
         )
@@ -104,6 +108,7 @@ def main() -> None:
         "input_path": str(args.input_path.resolve()),
         "input_bytes": args.input_path.stat().st_size,
         "requested_workers": args.num_workers,
+        "chunk_size_bytes": args.chunk_size_mib * 1024 * 1024,
         "vocabulary_size": len(vocab),
         "merge_count": len(merges),
         "result_sha256": hashlib.sha256(signature).hexdigest(),
