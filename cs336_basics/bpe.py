@@ -224,6 +224,7 @@ def single_bpe(
     while len(vocab) < vocab_size and heap:
         entry = heapq.heappop(heap)
         pair = entry.pair
+        # Lazy invalidation
         if entry.frequency != pair_count.get(pair, 0):
             continue
 
@@ -234,6 +235,7 @@ def single_bpe(
         changed.clear()
         for left in occurrences:
             right = following[left]
+            # Curr pair at target locations might have been mutated
             if tokens[left] != pair[0] or right == -1 or tokens[right] != pair[1]:
                 continue
 
