@@ -62,6 +62,8 @@ def test_command_saves_training_outputs(tmp_path, profile):
         "1",
         "--vocab-size",
         "280",
+        "--memory-interval",
+        "0.01",
         "--output-dir",
         str(output),
     ]
@@ -85,6 +87,18 @@ def test_command_saves_training_outputs(tmp_path, profile):
     assert report["chunk_size_bytes"] == 1024 * 1024
     assert report["stage_seconds"]["chunks"] >= 2
     assert report["artifact_paths"]["vocab"] == str(output / "vocab.json")
+    memory = report["sampled_memory"]
+    assert memory["sample_count"] >= 2
+    assert [event["stage"] for event in memory["stage_events"]] == [
+        "boundaries", "pretokenization", "initialization", "merging", "cleanup",
+    ]
+    samples = [json.loads(line) for line in (output / "memory-samples.jsonl").read_text().splitlines()]
+    assert memory["peak_tree_rss_sample"]["tree_rss_bytes"] == max(row["tree_rss_bytes"] for row in samples)
+    assert all(row["tree_rss_bytes"] == row["parent_rss_bytes"] + row["children_rss_bytes"] for row in samples)
+    stats = report["training_statistics"]
+    assert stats["effective_workers"] == 2
+    assert stats["pretoken_occurrences"] > stats["unique_pretokens"] > 0
+    assert stats["nodes"] >= stats["unique_pretokens"]
     if profile:
         stats = pstats.Stats(str(next(output.glob("profiles-*/parent.prof"))))
         assert not any(key[2] == "_save_training_artifacts" for key in stats.stats)

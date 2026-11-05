@@ -78,6 +78,9 @@ target/
 # dataset
 data/
 
+# benchmark & profiling
+benchmarks/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

@@ -1,12 +1,91 @@
 import heapq
 import json
 import os
+from collections import deque
 from collections.abc import Iterable, Iterator
+from itertools import chain, groupby
 from typing import Self
 
 import regex as re
 
 from .bpe import _PRETOKEN_PATTERN
+
+
+_PRETOKEN_CHARACTER_PATTERN = re.compile(
+    r"(?P<letter>\p{L})|(?P<number>\p{N})|(?P<whitespace>\s)|(?P<punctuation>[^\s\p{L}\p{N}])"
+)
+
+
+def _iter_regex_pretokens(fragments: Iterable[str]) -> Iterator[str]:
+    """Recognize the training regex's ordinary pre-tokens in O(N) total time.
+
+    Call this on ONE ordinary-text region after special-token recognition;
+    exhausting fragments means that region has ended (at a special token or EOF).
+    Input fragment boundaries themselves have no tokenization significance.
+
+    Each character is classified once with the same Unicode regex engine as
+    training. At most three classified characters are held for lookahead; runs
+    accumulate in a list and are joined only when finalized. Time is O(N + F)
+    for N characters across F fragments (including empty ones). Working memory
+    is O(L), plus the current input fragment, for longest pre-token/run length L.
+    This state machine is specific to _PRETOKEN_PATTERN; keep them in sync.
+    """
+    def characters() -> Iterator[tuple[str, str]]:
+        for fragment in fragments:
+            for character in fragment:
+                match = _PRETOKEN_CHARACTER_PATTERN.fullmatch(character)
+                assert match is not None and match.lastgroup is not None
+                yield character, match.lastgroup
+
+    source = characters()
+    pending: deque[tuple[str, str]] = deque()
+    exhausted = False
+
+    def peek(offset: int = 0) -> tuple[str, str] | None:
+        nonlocal exhausted
+        while len(pending) <= offset and not exhausted:
+            try:
+                pending.append(next(source))
+            except StopIteration:
+                exhausted = True
+        return pending[offset] if offset < len(pending) else None
+
+    contraction_endings = {"l": "l", "v": "e", "r": "e"}
+    while (first := peek()) is not None:
+        # The contraction alternative has priority only at the match's start.
+        # An apostrophe within a punctuation run (including " '") is ordinary.
+        if first[0] == "'":
+            second = peek(1)
+            width = 0
+            if second is not None:
+                if second[0] in "sdmt":
+                    width = 2
+                elif second[0] in contraction_endings:
+                    third = peek(2)
+                    if third is not None and third[0] == contraction_endings[second[0]]:
+                        width = 3
+            if width:
+                yield "".join(pending.popleft()[0] for _ in range(width))
+                continue
+
+        parts: list[str] = []
+        # Only an ASCII space can prefix a letter/number/punctuation run.
+        if first[0] == " ":
+            second = peek(1)
+            if second is not None and second[1] != "whitespace":
+                parts.append(pending.popleft()[0])
+                first = second
+
+        kind = first[1]
+        while (current := peek()) is not None and current[1] == kind:
+            parts.append(pending.popleft()[0])
+
+        if kind == "whitespace" and current is not None and len(parts) > 1:
+            # Before a non-whitespace character, \s+(?!\S) backs off exactly
+            # one whitespace character. That last character starts the next
+            # match, possibly as the ASCII-space prefix of a non-whitespace run.
+            pending.appendleft((parts.pop(), "whitespace"))
+        yield "".join(parts)
 
 
 class Tokenizer:
@@ -50,6 +129,18 @@ class Tokenizer:
             re.compile("|".join(re.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True)))
             if self.special_tokens else None
         )
+        # The streaming matcher uses a trie to recognize literal special tokens
+        # across fragments and delay shorter matches while a longer one is possible.
+        self._special_trie: list[dict[str, int]] = [{}]
+        self._special_terminals: dict[int, str] = {}
+        for token in self.special_tokens:
+            node = 0
+            for character in token:
+                if character not in self._special_trie[node]:
+                    self._special_trie[node][character] = len(self._special_trie)
+                    self._special_trie.append({})
+                node = self._special_trie[node][character]
+            self._special_terminals[node] = token
     
     @classmethod
     def from_files(
@@ -135,11 +226,62 @@ class Tokenizer:
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        '''
-        Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs. 
-        This is required for memory-efficient tokenization of large files that we cannot directly load into memory.
-        '''
-        pass
+        """Lazily encode concatenated fragments, preserving all token boundaries.
+
+        Only the current input fragment, unresolved pre-token, special-token
+        lookahead, and that pre-token's BPE state/output are retained. Very long
+        pre-tokens can still require substantial memory. No corpus-wide output
+        list or cache is accumulated; all streaming state belongs to this call.
+        """
+        if not self.special_tokens:
+            for pretoken in _iter_regex_pretokens(iterable):
+                yield from self._encode_pretoken(pretoken.encode("utf-8"))
+            return
+
+        # groupby supplies each ordinary region lazily. Reaching its end tells
+        # the regex recognizer to flush, even if the special abuts a word/space.
+        parts = self._iter_special_parts(iterable)
+        for is_special, region in groupby(parts, key=lambda part: part[0]):
+            if is_special:
+                for _, special in region:
+                    yield self.token_to_id[special.encode("utf-8")]
+            else:
+                for pretoken in _iter_regex_pretokens(text for _, text in region):
+                    yield from self._encode_pretoken(pretoken.encode("utf-8"))
+
+    def _iter_special_parts(self, fragments: Iterable[str]) -> Iterator[tuple[bool, str]]:
+        """Yield ordinary characters or whole special tokens, earliest/longest first.
+
+        Lookahead is bounded by maximum special-token length S. Failed prefixes
+        are replayed so a match starting inside them is not lost. Worst-case
+        matching time is O(N*S + F), linear in input size for fixed specials;
+        this simple trie matcher is not an Aho-Corasick automaton.
+        """
+        source = chain.from_iterable(fragments)
+        pending: deque[str] = deque()
+        while True:
+            node = 0
+            candidate: list[str] = []
+            best: str | None = None
+            while True:
+                character = pending.popleft() if pending else next(source, None)
+                if character is None:
+                    break
+                candidate.append(character)
+                child = self._special_trie[node].get(character)
+                if child is None:
+                    break
+                node = child
+                if node in self._special_terminals:
+                    best = self._special_terminals[node]
+                if not self._special_trie[node]:
+                    break
+
+            if not candidate:
+                return
+            consumed = len(best) if best is not None else 1
+            pending.extendleft(reversed(candidate[consumed:]))
+            yield (True, best) if best is not None else (False, candidate[0])
    
     def decode(self, ids: list[int]) -> str:
         '''

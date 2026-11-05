@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import re as standard_re
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from itertools import islice
 from pathlib import Path
@@ -106,6 +107,8 @@ def single_bpe(
     chunk_size_bytes: int = 128 * 1024 * 1024,
     profile_dir: str | os.PathLike | None = None,
     timings: dict[str, float] | None = None,
+    statistics: dict[str, int] | None = None,
+    stage_callback: Callable[[str], None] | None = None,
     **kwargs,
 ) -> tuple[dict[int, bytes], list[Pair]]:
     """Train BPE with sequential merges and optionally parallel pre-tokenization.
@@ -123,6 +126,8 @@ def single_bpe(
     profiler); timings receives stage wall times in seconds.
     """
     started = perf_counter()
+    if stage_callback is not None:
+        stage_callback("boundaries")
     if num_workers < 1:
         raise ValueError("num_workers must be positive")
     if chunk_size_bytes < 1:
@@ -149,6 +154,8 @@ def single_bpe(
         for start, end in zip(boundaries, boundaries[1:])
     ]
     boundary_finished = perf_counter()
+    if stage_callback is not None:
+        stage_callback("pretokenization")
     pretoken_count: Counter[bytes] = Counter()
     if num_workers == 1 or len(tasks) == 1:
         # Keep sequential work inside the caller's profile, rather than nesting
@@ -173,6 +180,15 @@ def single_bpe(
                 for task in islice(task_iterator, workers - len(pending)):
                     pending.add(pool.submit(_count_chunk, task))
     pretokenization_finished = perf_counter()
+    if stage_callback is not None:
+        stage_callback("initialization")
+    if statistics is not None:
+        statistics.update(
+            unique_pretokens=len(pretoken_count),
+            pretoken_occurrences=sum(pretoken_count.values()),
+            chunks=len(tasks),
+            effective_workers=1 if num_workers == 1 or len(tasks) == 1 else workers,
+        )
 
     # Indices never shift. Empty bytes mark consumed nodes; live tokens are nonempty.
     tokens: list[bytes] = []
@@ -202,6 +218,10 @@ def single_bpe(
     merges: list[Pair] = []
     changed: set[Pair] = set()
     initialization_finished = perf_counter()
+    if statistics is not None:
+        statistics.update(nodes=len(tokens), initial_pair_types=len(pair_count), initial_heap_entries=len(heap))
+    if stage_callback is not None:
+        stage_callback("merging")
 
     def remove_edge(left: int) -> None:
         right = following[left]
@@ -278,4 +298,8 @@ def single_bpe(
             total=finished - started,
             chunks=float(len(tasks)),
         )
+    if statistics is not None:
+        statistics.update(final_pair_types=len(pair_count), final_heap_entries=len(heap))
+    if stage_callback is not None:
+        stage_callback("cleanup")
     return vocab, merges
