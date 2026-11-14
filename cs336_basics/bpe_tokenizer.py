@@ -284,7 +284,5 @@ class Tokenizer:
             yield (True, best) if best is not None else (False, candidate[0])
    
     def decode(self, ids: list[int]) -> str:
-        '''
-        Decode a sequence of token IDs into text.
-        '''
-        pass
+        """Decode token bytes together, replacing invalid UTF-8 sequences."""
+        return b"".join(self.vocab[token_id] for token_id in ids).decode("utf-8", errors="replace")
