@@ -71,3 +71,36 @@ class RMSNorm(nn.Module):
         mean_square = reduce(x.square(), "... d_model -> ... 1", "mean")
         result = x * torch.rsqrt(mean_square + self.eps) * self.weight.to(torch.float32)
         return result.to(in_dtype)
+
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    """Apply SiLU element-wise: x * sigmoid(x)."""
+    return x * torch.sigmoid(x)
+
+
+class SwiGLU(nn.Module):
+    """Position-wise feed-forward network with a SiLU-gated hidden branch.
+
+    FFN(x) = SwiGLU(x, W1, W2, W3) = W2(SiLU(W1 x) ⊙ W3 x).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        # Default to approximately 8/3 of d_model, rounded up to a multiple of 64.
+        self.d_ff = d_ff if d_ff is not None else math.ceil((8 * d_model / 3) / 64) * 64
+        self.w1 = Linear(d_model, self.d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(self.d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, self.d_ff, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Transform (..., d_model) independently at each leading position."""
+        gate = silu(self.w1(x))
+        values = self.w3(x)
+        return self.w2(gate * values)
